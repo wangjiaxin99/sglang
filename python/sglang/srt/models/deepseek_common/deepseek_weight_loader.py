@@ -83,23 +83,62 @@ def _load_fused_indexer_wk(
     pending: Dict[str, Dict[str, torch.Tensor]],
     quant_config: Optional[QuantizationConfig],
 ) -> bool:
-    """Load an indexer wk / weights_proj shard into the fused bf16 wk_weights_proj
-    param: wk fills the top head_dim rows (dequantized from block-fp8 if needed),
-    weights_proj the bottom n_heads rows.
+    """Load an indexer wk / weights_proj shard.
 
-    Returns False when there is no fused param (non-CUDA, or CUDA with
-    SGLANG_DISABLE_DSA_INDEXER_FUSION set, where wk and weights_proj are
-    separate) so the caller falls through to per-tensor loading.
+    When CUDA fuses wk + weights_proj into one bf16 wk_weights_proj param: wk
+    fills the top head_dim rows (dequantized from block-fp8 if needed),
+    weights_proj the bottom n_heads rows (dequantized from per-channel fp8 if
+    needed).
+
+    When there is no fused param (non-CUDA, or CUDA with
+    SGLANG_DISABLE_DSA_INDEXER_FUSION set, where wk and weights_proj stay
+    separate bf16 modules): wk keeps its own quant_config-backed weight_scale
+    param and is handled correctly by the normal per-tensor loading path, so
+    it's left alone here. weights_proj, however, is always built as a plain
+    bf16 module with no weight_scale param of its own (see dsa_indexer.py),
+    so an fp8-quantized weights_proj checkpoint would otherwise have its
+    weight_scale silently dropped by the per-tensor path and its raw fp8
+    codes copied in unscaled; dequantize it here instead. A bf16 checkpoint
+    for weights_proj has no scale to apply, so it's left to the per-tensor
+    path in that case.
+
+    Returns False when the shard isn't handled here, so the caller falls
+    through to per-tensor loading.
     """
     fused_name = name.rsplit(".indexer.", 1)[0] + ".indexer.wk_weights_proj.weight"
     fused_param = params_dict.get(fused_name)
-    if fused_param is None or fused_param.dtype != torch.bfloat16:
-        return False
+    fused = fused_param is not None and fused_param.dtype == torch.bfloat16
 
     if ".indexer.weights_proj." in name:
-        w = _clone_if_runai_streamed_tensor(loaded_weight)
-        fused_param.data[-w.shape[0] :].copy_(w)
+        is_scale = name.endswith(".weight_scale")
+        if not is_scale and loaded_weight.dtype != torch.float8_e4m3fn:
+            if not fused:
+                return False
+            w = _clone_if_runai_streamed_tensor(loaded_weight)
+            fused_param.data[-w.shape[0] :].copy_(w)
+            return True
+
+        dest_name = fused_name if fused else name.rsplit(".", 1)[0] + ".weight"
+        if not fused and dest_name not in params_dict:
+            return False
+        entry = pending.setdefault(dest_name, {})
+        entry["scale" if is_scale else "weight"] = _clone_if_runai_streamed_tensor(
+            loaded_weight
+        )
+        if "weight" not in entry or "scale" not in entry:
+            return True
+        pending.pop(dest_name)
+        w_bf16 = (entry["weight"].to(torch.float32) * entry["scale"].view(-1, 1)).to(
+            torch.bfloat16
+        )
+        if fused:
+            fused_param.data[-w_bf16.shape[0] :].copy_(w_bf16)
+        else:
+            params_dict[dest_name].data.copy_(w_bf16)
         return True
+
+    if not fused:
+        return False
 
     # wk: a bf16 checkpoint copies straight in; block-fp8 needs weight + scale.
     is_scale = name.endswith(".weight_scale_inv")
